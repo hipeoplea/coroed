@@ -23,7 +23,7 @@ TASK_DEFINE(event_test, void, ignored) {
 }
 
 void test_event() {
-  tasks_init();
+  tasks_init(TASK_SCHED_RR);
   tasks_submit(&event_test, NULL);
   tasks_start();
   tasks_wait();

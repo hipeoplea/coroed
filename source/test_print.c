@@ -44,7 +44,7 @@ TASK_DEFINE(spammer, void, ignored) {
 
 void test_print() {
   printf("\n");
-  tasks_init();
+  tasks_init(TASK_SCHED_RR);
   tasks_submit(&spammer, NULL);
   tasks_start();
   tasks_wait();

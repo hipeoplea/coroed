@@ -13,6 +13,8 @@
 #include "coroed/core/relax.h"
 #include "coroed/core/spinlock.h"
 #include "kthread.h"
+#include "sched_policy.h"
+#include "sched_task.h"
 #include "uthread.h"
 
 enum {
@@ -33,47 +35,6 @@ enum {
    * конкуренции на спинлоках файберов.
    */
   SCHED_NEXT_MAX_ATTEMPTS = (size_t)(16),
-};
-
-/**
- * Задача, выполняющаяся на планировщике.
- *
- * Hint: также тут можно хранить список задач, ожидающих
- *       завершения этой, чтобы уведомить их о данном
- *       событии.
- */
-struct task {
-  /**
-   * Контекст исполнения.
-   */
-  struct uthread* thread;
-
-  /**
-   * Установлен при `UTHREAD_RUNNING`. Указывает на
-   * рабочий поток, на котором исполняется задача.
-   * Необходим для получения контекста локального
-   * планировщика при операциях `yield`, `await`, `submit`.
-   */
-  struct worker* worker;
-
-  enum {
-    /** Готова к исполнению. */
-    UTHREAD_RUNNABLE,
-
-    /** Прямо сейчас выполняется. */
-    UTHREAD_RUNNING,
-
-    /** Завершена и скоро станет зомби. */
-    UTHREAD_FINISHED,
-
-    /** Отработала и может быть переиспользования. */
-    UTHREAD_ZOMBIE,
-  } state;  // Текущее состояние задачи
-
-  /**
-   * Защищает поля структуры от неупорядоченного доступа.
-   */
-  struct spinlock lock;
 };
 
 /**
@@ -119,6 +80,9 @@ static struct task tasks[SCHED_THREADS_LIMIT];  // Список всех зад�
 static kthread_id_t kthread_ids[SCHED_WORKERS_COUNT];
 static struct worker workers[SCHED_WORKERS_COUNT];
 
+static task_sched_policy sched_policy;
+static const struct sched_policy_ops* sched_ops;
+
 /**
  * Установить задачу в пустое состояние.
  */
@@ -127,6 +91,10 @@ void sched_task_init(struct task* task) {
   task->worker = NULL;
   task->state = UTHREAD_ZOMBIE;
   spinlock_init(&task->lock);
+  task->mlfq_level = 0;
+  task->mlfq_ticks = 0;
+  task->vruntime = 0;
+  task->weight = 0;
 }
 
 /**
@@ -140,7 +108,11 @@ void sched_worker_init(struct worker* worker, size_t index) {
   worker->statistics.finished = 0;
 }
 
-void sched_init() {
+void sched_init(task_sched_policy policy) {
+  sched_policy = policy;
+  sched_ops = sched_policy_get(policy);
+  assert(sched_ops != NULL);
+  sched_ops->init();
   spinlock_init(&tasks_lock);
   for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
     sched_task_init(&tasks[i]);
@@ -185,7 +157,9 @@ void sched_switch_to(struct worker* worker, struct task* task) {
  * Вызывающему передается владение задачей, а также
  * захваченный лок `task->lock`.
  */
-struct task* sched_acquire_next();
+static struct task* sched_acquire_next_rr();
+static struct task* sched_acquire_next_policy();
+static struct task* sched_acquire_next();
 
 /**
  * Вернуть задачу в очередь планирования.
@@ -226,7 +200,7 @@ int sched_loop(void* argument) {
   return 0;
 }
 
-struct task* sched_acquire_next() {
+static struct task* sched_acquire_next_rr() {
   // На всякий случай пытаемся найти задачу несколько раз,
   // так как какие-то `task->lock` могли быть отпущены.
 
@@ -257,6 +231,37 @@ struct task* sched_acquire_next() {
   return NULL;
 }
 
+static struct task* sched_acquire_next_policy() {
+  for (size_t attempt = 0; attempt < SCHED_NEXT_MAX_ATTEMPTS; ++attempt) {
+    struct task* task = sched_ops->dequeue();
+    if (task == NULL) {
+      break;
+    }
+
+    if (!spinlock_try_lock(&task->lock)) {
+      sched_ops->requeue(task);
+      continue;
+    }
+
+    if (task->thread != NULL && task->state == UTHREAD_RUNNABLE) {
+      return task;
+    }
+
+    spinlock_unlock(&task->lock);
+    sched_ops->requeue(task);
+  }
+
+  return NULL;
+}
+
+static struct task* sched_acquire_next() {
+  if (sched_policy == TASK_SCHED_RR) {
+    return sched_acquire_next_rr();
+  }
+
+  return sched_acquire_next_policy();
+}
+
 void sched_release(struct task* task) {
   task->worker = NULL;
   if (task->state == UTHREAD_FINISHED) {
@@ -264,8 +269,14 @@ void sched_release(struct task* task) {
     // еще, например, разблокировать зависимые задачи.
     uthread_reset(task->thread);
     task->state = UTHREAD_ZOMBIE;
+    if (sched_policy != TASK_SCHED_RR) {
+      sched_ops->on_finish(task);
+    }
   } else if (task->state == UTHREAD_RUNNING) {
     task->state = UTHREAD_RUNNABLE;
+    if (sched_policy != TASK_SCHED_RR) {
+      sched_ops->on_yield(task);
+    }
   } else /* if (task->state == UTHREAD_BLOCKED) */ {
     assert(false && "Not implemented");
   }
@@ -316,6 +327,9 @@ task_t sched_try_submit(void (*entry)(), void* argument) {
       uthread_set_arg_0(task->thread, task);
       uthread_set_arg_1(task->thread, argument);
       task->state = UTHREAD_RUNNABLE;
+      if (sched_policy != TASK_SCHED_RR) {
+        sched_ops->on_submit(task);
+      }
     }
 
     spinlock_unlock(&task->lock);
@@ -378,6 +392,9 @@ void sched_print_statistics() {
 }
 
 void sched_destroy() {
+  if (sched_ops != NULL) {
+    sched_ops->destroy();
+  }
   for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
     struct task* task = &tasks[i];
     spinlock_lock(&task->lock);
@@ -386,4 +403,44 @@ void sched_destroy() {
     }
     spinlock_unlock(&task->lock);
   }
+}
+
+static void sched_rr_init() {
+}
+
+static void sched_rr_on_submit(struct task* task) {
+  (void)task;
+}
+
+static struct task* sched_rr_dequeue() {
+  return NULL;
+}
+
+static void sched_rr_requeue(struct task* task) {
+  (void)task;
+}
+
+static void sched_rr_on_yield(struct task* task) {
+  (void)task;
+}
+
+static void sched_rr_on_finish(struct task* task) {
+  (void)task;
+}
+
+static void sched_rr_destroy() {
+}
+
+static const struct sched_policy_ops sched_rr_ops_instance = {
+    .init = sched_rr_init,
+    .on_submit = sched_rr_on_submit,
+    .dequeue = sched_rr_dequeue,
+    .requeue = sched_rr_requeue,
+    .on_yield = sched_rr_on_yield,
+    .on_finish = sched_rr_on_finish,
+    .destroy = sched_rr_destroy,
+};
+
+const struct sched_policy_ops* sched_rr_ops() {
+  return &sched_rr_ops_instance;
 }

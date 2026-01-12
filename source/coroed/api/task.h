@@ -26,12 +26,21 @@ typedef struct {
 typedef uthread_routine task_body;
 
 /**
+ * Политика планирования задач.
+ */
+typedef enum {
+  TASK_SCHED_RR,
+  TASK_SCHED_MLFQ,
+  TASK_SCHED_CFS,
+} task_sched_policy;
+
+/**
  * Инициализировать планировщик.
  *
  * Должен быть вызван ровно один раз до вызова
  * `tasks_destroy`.
  */
-void tasks_init();
+void tasks_init(task_sched_policy policy);
 
 /**
  * Отправить задачу `body` в планировщик с аргументом.

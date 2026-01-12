@@ -2,8 +2,8 @@
 
 #include "coroed/sched/schedy.h"
 
-void tasks_init() {
-  sched_init();
+void tasks_init(task_sched_policy policy) {
+  sched_init(policy);
 }
 
 void tasks_submit(task_body body, void* argument) {

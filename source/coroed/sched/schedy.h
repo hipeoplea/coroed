@@ -5,7 +5,7 @@
 
 struct task;
 
-void sched_init();
+void sched_init(task_sched_policy policy);
 
 task_t sched_submit(uthread_routine entry, void* argument);
 
