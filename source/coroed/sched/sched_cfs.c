@@ -14,6 +14,14 @@ static struct spinlock cfs_lock;
 static struct cfs_tree cfs_runqueue;
 static uint64_t cfs_min_vruntime = 0;
 
+static uint64_t cfs_vruntime_delta(const struct task* task) {
+  if (task->weight == 0) {
+    return CFS_VRUNTIME_DELTA;
+  }
+  uint64_t delta = (CFS_VRUNTIME_DELTA * CFS_WEIGHT_DEFAULT) / task->weight;
+  return delta == 0 ? 1 : delta;
+}
+
 static int cfs_task_cmp(struct task* left, struct task* right) {
   if (left->vruntime < right->vruntime) {
     return -1;
@@ -41,7 +49,9 @@ static void sched_cfs_init() {
 
 static void sched_cfs_on_submit(struct task* task, struct worker* worker) {
   (void)worker;
-  task->weight = CFS_WEIGHT_DEFAULT;
+  if (task->weight == 0) {
+    task->weight = CFS_WEIGHT_DEFAULT;
+  }
   task->vruntime = cfs_min_vruntime;
   spinlock_lock(&cfs_lock);
   cfs_tree_RB_INSERT(&cfs_runqueue, task);
@@ -78,8 +88,7 @@ static void sched_cfs_requeue(struct task* task, struct worker* worker) {
 }
 
 static void sched_cfs_on_yield(struct task* task, struct worker* worker) {
-  (void)task->weight;
-  task->vruntime += CFS_VRUNTIME_DELTA;
+  task->vruntime += cfs_vruntime_delta(task);
   sched_cfs_requeue(task, worker);
 }
 

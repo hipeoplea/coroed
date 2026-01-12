@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "kthread.h"
 #include "uthread.h"
@@ -37,5 +38,6 @@ struct worker {
   struct {
     size_t steps;     // Сколько шагов было выполнено
     size_t finished;  // Сколько задач было завершено
+    uint64_t run_time_ns;  // Время выполнения задач
   } statistics;       // Локальная статистика работяги
 };

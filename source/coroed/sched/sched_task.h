@@ -59,4 +59,13 @@ struct task {
   RB_ENTRY(task) cfs_entry;
   uint64_t vruntime;
   uint64_t weight;
+
+  /**
+   * Поля для метрик планирования.
+   */
+  uint64_t submit_ts;
+  uint64_t first_run_ts;
+  uint64_t finish_ts;
+  uint64_t run_time_ns;
+  uint64_t yields;
 };

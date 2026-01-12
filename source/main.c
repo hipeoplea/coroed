@@ -18,6 +18,7 @@ struct test {
 void test_counter();
 void test_event();
 void test_print();
+void test_bench();
 
 static task_sched_policy parse_policy(const char* name) {
   if (strcmp(name, "rr") == 0) {
@@ -47,6 +48,7 @@ int main(int argc, char** argv) {
       {"counter", test_counter},
       {  "event",   test_event},
       {  "print",   test_print},
+      {  "bench",   test_bench},
       {     NULL,         NULL},
   };
 

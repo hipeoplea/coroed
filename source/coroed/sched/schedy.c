@@ -49,6 +49,27 @@ static struct worker workers[SCHED_WORKERS_COUNT];
 
 static task_sched_policy sched_policy_current;
 static const struct sched_policy_ops* sched_ops;
+static uint64_t sched_start_ts = 0;
+static uint64_t sched_end_ts = 0;
+
+static uint64_t sched_time_now_ns() {
+  struct timespec spec;
+  int code = clock_gettime(CLOCK_MONOTONIC, &spec);
+  assert(code == 0);
+  return (uint64_t)spec.tv_sec * 1000000000ULL + (uint64_t)spec.tv_nsec;
+}
+
+static int sched_u64_cmp(const void* left, const void* right) {
+  uint64_t a = *(const uint64_t*)left;
+  uint64_t b = *(const uint64_t*)right;
+  if (a < b) {
+    return -1;
+  }
+  if (a > b) {
+    return 1;
+  }
+  return 0;
+}
 
 /**
  * Установить задачу в пустое состояние.
@@ -62,6 +83,11 @@ void sched_task_init(struct task* task) {
   task->mlfq_ticks = 0;
   task->vruntime = 0;
   task->weight = 0;
+  task->submit_ts = 0;
+  task->first_run_ts = 0;
+  task->finish_ts = 0;
+  task->run_time_ns = 0;
+  task->yields = 0;
 }
 
 /**
@@ -73,6 +99,7 @@ void sched_worker_init(struct worker* worker, size_t index) {
   worker->running_task = NULL;
   worker->statistics.steps = 0;
   worker->statistics.finished = 0;
+  worker->statistics.run_time_ns = 0;
 }
 
 void sched_init(task_sched_policy policy) {
@@ -114,7 +141,15 @@ void sched_switch_to(struct worker* worker, struct task* task) {
   worker->running_task = task;
 
   struct uthread* sched = &worker->sched_thread;
+  uint64_t start_ts = sched_time_now_ns();
+  if (task->first_run_ts == 0) {
+    task->first_run_ts = start_ts;
+  }
   uthread_switch(sched, task->thread);
+  uint64_t end_ts = sched_time_now_ns();
+  uint64_t delta_ns = end_ts - start_ts;
+  task->run_time_ns += delta_ns;
+  worker->statistics.run_time_ns += delta_ns;
 }
 
 /**
@@ -239,11 +274,15 @@ void sched_release(struct worker* worker, struct task* task) {
     // еще, например, разблокировать зависимые задачи.
     uthread_reset(task->thread);
     task->state = UTHREAD_ZOMBIE;
+    if (task->finish_ts == 0) {
+      task->finish_ts = sched_time_now_ns();
+    }
     if (sched_policy_current != TASK_SCHED_RR) {
       sched_ops->on_finish(task, worker);
     }
   } else if (task->state == UTHREAD_RUNNING) {
     task->state = UTHREAD_RUNNABLE;
+    task->yields += 1;
     if (sched_policy_current != TASK_SCHED_RR) {
       sched_ops->on_yield(task, worker);
     }
@@ -293,6 +332,11 @@ static task_t sched_try_submit_with_worker(void (*entry)(),
       uthread_set_arg_0(task->thread, task);
       uthread_set_arg_1(task->thread, argument);
       task->state = UTHREAD_RUNNABLE;
+      task->submit_ts = sched_time_now_ns();
+      task->first_run_ts = 0;
+      task->finish_ts = 0;
+      task->run_time_ns = 0;
+      task->yields = 0;
       if (sched_policy_current != TASK_SCHED_RR) {
         sched_ops->on_submit(task, worker);
       }
@@ -343,6 +387,7 @@ task_t sched_submit(void (*entry)(), void* argument) {
 }
 
 void sched_start() {
+  sched_start_ts = sched_time_now_ns();
   for (size_t i = 0; i < SCHED_WORKERS_COUNT; ++i) {
     struct worker* worker = &workers[i];
     enum kthread_status status = kthread_create(&worker->kthread, sched_loop, worker);
@@ -356,6 +401,7 @@ void sched_wait() {
     enum kthread_status status = kthread_join(&worker->kthread);
     assert(status == KTHREAD_SUCCESS);
   }
+  sched_end_ts = sched_time_now_ns();
 }
 
 void sched_print_statistics() {
@@ -372,11 +418,68 @@ void sched_print_statistics() {
   printf("|- tasks executed %zu\n", tasks_count);
   printf("|- steps done     %zu\n", steps_count);
 
+  uint64_t latencies_ns[SCHED_THREADS_LIMIT];
+  uint64_t responses_ns[SCHED_THREADS_LIMIT];
+  uint64_t total_latency_ns = 0;
+  uint64_t total_response_ns = 0;
+  size_t measured = 0;
+
+  for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
+    struct task* task = &tasks[i];
+    if (task->submit_ts == 0 || task->finish_ts == 0) {
+      continue;
+    }
+    uint64_t latency = task->finish_ts - task->submit_ts;
+    uint64_t response = 0;
+    if (task->first_run_ts > task->submit_ts) {
+      response = task->first_run_ts - task->submit_ts;
+    }
+    latencies_ns[measured] = latency;
+    responses_ns[measured] = response;
+    total_latency_ns += latency;
+    total_response_ns += response;
+    measured += 1;
+  }
+
+  if (measured > 0) {
+    qsort(latencies_ns, measured, sizeof(uint64_t), sched_u64_cmp);
+    qsort(responses_ns, measured, sizeof(uint64_t), sched_u64_cmp);
+    size_t p95_index = (measured * 95 + 99) / 100;
+    if (p95_index == 0) {
+      p95_index = 1;
+    }
+    p95_index -= 1;
+
+    uint64_t total_time_ns = 0;
+    if (sched_end_ts > sched_start_ts) {
+      total_time_ns = sched_end_ts - sched_start_ts;
+    }
+    double total_time_s = (double)total_time_ns / 1000000000.0;
+    double throughput = total_time_s > 0.0 ? (double)measured / total_time_s : 0.0;
+    double avg_latency_ms = (double)total_latency_ns / (double)measured / 1000000.0;
+    double avg_response_ms = (double)total_response_ns / (double)measured / 1000000.0;
+    double p95_latency_ms = (double)latencies_ns[p95_index] / 1000000.0;
+    double p95_response_ms = (double)responses_ns[p95_index] / 1000000.0;
+
+    printf("|- total time    %.3f s\n", total_time_s);
+    printf("|- throughput    %.2f tasks/s\n", throughput);
+    printf("|- latency avg   %.3f ms\n", avg_latency_ms);
+    printf("|- latency p95   %.3f ms\n", p95_latency_ms);
+    printf("|- response avg  %.3f ms\n", avg_response_ms);
+    printf("|- response p95  %.3f ms\n", p95_response_ms);
+  }
+
   for (size_t i = 0; i < SCHED_WORKERS_COUNT; ++i) {
     struct worker* worker = &workers[i];
     printf("|- worker %zu %zu\n", i, kthread_ids[i]);
     printf("   |- steps     %zu\n", worker->statistics.steps);
     printf("   |- finished  %zu\n", worker->statistics.finished);
+    printf("   |- run time  %.3f ms\n", (double)worker->statistics.run_time_ns / 1000000.0);
+    if (worker->statistics.finished > 0) {
+      double avg_runtime_ms =
+          (double)worker->statistics.run_time_ns / (double)worker->statistics.finished / 1000000.0;
+      printf("   |- avg task  %.3f ms\n", avg_runtime_ms);
+    }
   }
 }
 
