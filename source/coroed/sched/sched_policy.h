@@ -5,11 +5,11 @@
 
 struct sched_policy_ops {
   void (*init)();
-  void (*on_submit)(struct task* task);
-  struct task* (*dequeue)();
-  void (*requeue)(struct task* task);
-  void (*on_yield)(struct task* task);
-  void (*on_finish)(struct task* task);
+  void (*on_submit)(struct task* task, struct worker* worker);
+  struct task* (*dequeue)(struct worker* worker);
+  void (*requeue)(struct task* task, struct worker* worker);
+  void (*on_yield)(struct task* task, struct worker* worker);
+  void (*on_finish)(struct task* task, struct worker* worker);
   void (*destroy)();
 };
 

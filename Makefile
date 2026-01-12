@@ -25,7 +25,7 @@ OBJS     := $(patsubst $(SRC_DIR)/%.S, $(OBJ_DIR)/%.o, $(OBJS))
 TARGET    = app
 
 run: $(BIN_DIR)/$(TARGET)
-	./$(BIN_DIR)/$(TARGET)
+	./$(BIN_DIR)/$(TARGET) $(POLICY)
 
 compile: clean $(BIN_DIR)/$(TARGET)
 

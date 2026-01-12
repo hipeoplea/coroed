@@ -12,9 +12,9 @@
 #include "coroed/api/task.h"
 #include "coroed/core/relax.h"
 #include "coroed/core/spinlock.h"
-#include "kthread.h"
 #include "sched_policy.h"
 #include "sched_task.h"
+#include "sched_worker.h"
 #include "uthread.h"
 
 enum {
@@ -37,39 +37,6 @@ enum {
   SCHED_NEXT_MAX_ATTEMPTS = (size_t)(16),
 };
 
-/**
- * Рабочий поток, исполняющий файберы.
- */
-struct worker {
-  /**
-   * Идентификатор рабочего потока.
-   */
-  size_t index;
-
-  /**
-   * Поток операционной системы, на котором
-   * исполняется рабочий.
-   */
-  struct kthread kthread;
-
-  /**
-   * Контекст планировщика. Нужно переключиться на него,
-   * чтобы вернуться в планировщик.
-   */
-  struct uthread sched_thread;
-
-  /**
-   * В данный момент исполняемая на рабочем
-   * задача. Может быть `NULL`.
-   */
-  struct task* running_task;
-
-  struct {
-    size_t steps;     // Сколько шагов было выполнено
-    size_t finished;  // Сколько задач было завершено
-  } statistics;       // Локальная статистика работяги
-};
-
 static struct spinlock tasks_lock;              // Защищает список задач
 static size_t next_task_index = 0;              // Для планирования round-robin
 static struct task tasks[SCHED_THREADS_LIMIT];  // Список всех задач
@@ -80,7 +47,7 @@ static struct task tasks[SCHED_THREADS_LIMIT];  // Список всех зад�
 static kthread_id_t kthread_ids[SCHED_WORKERS_COUNT];
 static struct worker workers[SCHED_WORKERS_COUNT];
 
-static task_sched_policy sched_policy;
+static task_sched_policy sched_policy_current;
 static const struct sched_policy_ops* sched_ops;
 
 /**
@@ -109,7 +76,7 @@ void sched_worker_init(struct worker* worker, size_t index) {
 }
 
 void sched_init(task_sched_policy policy) {
-  sched_policy = policy;
+  sched_policy_current = policy;
   sched_ops = sched_policy_get(policy);
   assert(sched_ops != NULL);
   sched_ops->init();
@@ -158,8 +125,11 @@ void sched_switch_to(struct worker* worker, struct task* task) {
  * захваченный лок `task->lock`.
  */
 static struct task* sched_acquire_next_rr();
-static struct task* sched_acquire_next_policy();
-static struct task* sched_acquire_next();
+static struct task* sched_acquire_next_policy(struct worker* worker);
+static struct task* sched_acquire_next(struct worker* worker);
+static task_t sched_submit_with_worker(void (*entry)(),
+                                       void* argument,
+                                       struct worker* worker);
 
 /**
  * Вернуть задачу в очередь планирования.
@@ -167,7 +137,7 @@ static struct task* sched_acquire_next();
  * Очереди передается владение задачей,
  * а также она отпустит лок `task->lock`.
  */
-void sched_release(struct task* task);
+void sched_release(struct worker* worker, struct task* task);
 
 /**
  * Цикл планировщика. Выполняется, пока есть задачи.
@@ -177,7 +147,7 @@ int sched_loop(void* argument) {
   kthread_ids[worker->index] = kthread_id();
 
   for (;;) {
-    struct task* task = sched_acquire_next();
+    struct task* task = sched_acquire_next(worker);
     if (task == NULL) {
       break;
     }
@@ -189,7 +159,7 @@ int sched_loop(void* argument) {
       worker->statistics.finished += 1;
     }
 
-    sched_release(task);
+    sched_release(worker, task);
 
     // Hint: где-то здесь можно было бы опросить
     //       механизмы для неблокирующего ввода-вывода
@@ -231,15 +201,15 @@ static struct task* sched_acquire_next_rr() {
   return NULL;
 }
 
-static struct task* sched_acquire_next_policy() {
+static struct task* sched_acquire_next_policy(struct worker* worker) {
   for (size_t attempt = 0; attempt < SCHED_NEXT_MAX_ATTEMPTS; ++attempt) {
-    struct task* task = sched_ops->dequeue();
+    struct task* task = sched_ops->dequeue(worker);
     if (task == NULL) {
       break;
     }
 
     if (!spinlock_try_lock(&task->lock)) {
-      sched_ops->requeue(task);
+      sched_ops->requeue(task, worker);
       continue;
     }
 
@@ -248,34 +218,34 @@ static struct task* sched_acquire_next_policy() {
     }
 
     spinlock_unlock(&task->lock);
-    sched_ops->requeue(task);
+    sched_ops->requeue(task, worker);
   }
 
   return NULL;
 }
 
-static struct task* sched_acquire_next() {
-  if (sched_policy == TASK_SCHED_RR) {
+static struct task* sched_acquire_next(struct worker* worker) {
+  if (sched_policy_current == TASK_SCHED_RR) {
     return sched_acquire_next_rr();
   }
 
-  return sched_acquire_next_policy();
+  return sched_acquire_next_policy(worker);
 }
 
-void sched_release(struct task* task) {
+void sched_release(struct worker* worker, struct task* task) {
   task->worker = NULL;
   if (task->state == UTHREAD_FINISHED) {
     // Отправляем задачу на кладбище, а могли бы
     // еще, например, разблокировать зависимые задачи.
     uthread_reset(task->thread);
     task->state = UTHREAD_ZOMBIE;
-    if (sched_policy != TASK_SCHED_RR) {
-      sched_ops->on_finish(task);
+    if (sched_policy_current != TASK_SCHED_RR) {
+      sched_ops->on_finish(task, worker);
     }
   } else if (task->state == UTHREAD_RUNNING) {
     task->state = UTHREAD_RUNNABLE;
-    if (sched_policy != TASK_SCHED_RR) {
-      sched_ops->on_yield(task);
+    if (sched_policy_current != TASK_SCHED_RR) {
+      sched_ops->on_yield(task, worker);
     }
   } else /* if (task->state == UTHREAD_BLOCKED) */ {
     assert(false && "Not implemented");
@@ -299,13 +269,9 @@ void task_exit(struct task* caller) {
   task_yield(caller);
 }
 
-task_t task_submit(struct task* caller, uthread_routine entry, void* argument) {
-  (void)caller;  // Может быть полезно.
-  task_t child = sched_submit(*entry, argument);
-  return child;
-}
-
-task_t sched_try_submit(void (*entry)(), void* argument) {
+static task_t sched_try_submit_with_worker(void (*entry)(),
+                                           void* argument,
+                                           struct worker* worker) {
   for (size_t i = 0; i < SCHED_THREADS_LIMIT; ++i) {
     struct task* task = &tasks[i];
 
@@ -327,8 +293,8 @@ task_t sched_try_submit(void (*entry)(), void* argument) {
       uthread_set_arg_0(task->thread, task);
       uthread_set_arg_1(task->thread, argument);
       task->state = UTHREAD_RUNNABLE;
-      if (sched_policy != TASK_SCHED_RR) {
-        sched_ops->on_submit(task);
+      if (sched_policy_current != TASK_SCHED_RR) {
+        sched_ops->on_submit(task, worker);
       }
     }
 
@@ -341,9 +307,32 @@ task_t sched_try_submit(void (*entry)(), void* argument) {
   return (task_t){.task = NULL};
 }
 
+task_t task_submit(struct task* caller, uthread_routine entry, void* argument) {
+  task_t child = sched_submit_with_worker(*entry, argument, caller->worker);
+  return child;
+}
+
+task_t sched_try_submit(void (*entry)(), void* argument) {
+  return sched_try_submit_with_worker(entry, argument, NULL);
+}
+
+static task_t sched_submit_with_worker(void (*entry)(),
+                                       void* argument,
+                                       struct worker* worker) {
+  for (size_t attempt = 0; attempt < SCHED_NEXT_MAX_ATTEMPTS; ++attempt) {
+    task_t handle = sched_try_submit_with_worker(entry, argument, worker);
+    if (handle.task != NULL) {
+      return handle;
+    }
+    SPINLOOP(2 * attempt);
+  }
+
+  assert(false && "Can't create a task");
+}
+
 task_t sched_submit(void (*entry)(), void* argument) {
   for (size_t attempt = 0; attempt < SCHED_NEXT_MAX_ATTEMPTS; ++attempt) {
-    task_t handle = sched_try_submit(entry, argument);
+    task_t handle = sched_try_submit_with_worker(entry, argument, NULL);
     if (handle.task != NULL) {
       return handle;
     }
@@ -405,27 +394,37 @@ void sched_destroy() {
   }
 }
 
+size_t sched_workers_count() {
+  return SCHED_WORKERS_COUNT;
+}
+
+
 static void sched_rr_init() {
 }
 
-static void sched_rr_on_submit(struct task* task) {
+static void sched_rr_on_submit(struct task* task, struct worker* worker) {
   (void)task;
+  (void)worker;
 }
 
-static struct task* sched_rr_dequeue() {
+static struct task* sched_rr_dequeue(struct worker* worker) {
+  (void)worker;
   return NULL;
 }
 
-static void sched_rr_requeue(struct task* task) {
+static void sched_rr_requeue(struct task* task, struct worker* worker) {
   (void)task;
+  (void)worker;
 }
 
-static void sched_rr_on_yield(struct task* task) {
+static void sched_rr_on_yield(struct task* task, struct worker* worker) {
   (void)task;
+  (void)worker;
 }
 
-static void sched_rr_on_finish(struct task* task) {
+static void sched_rr_on_finish(struct task* task, struct worker* worker) {
   (void)task;
+  (void)worker;
 }
 
 static void sched_rr_destroy() {

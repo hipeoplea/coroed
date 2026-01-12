@@ -45,7 +45,7 @@ int64_t randint() {
 void test_counter() {
   static const size_t limit = 16;
 
-  tasks_init(TASK_SCHED_RR);
+  tasks_init(tasks_policy());
 
   int64_t expected_count = 0;
 

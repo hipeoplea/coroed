@@ -85,6 +85,16 @@ void tasks_print_statistics();
 void tasks_destroy();
 
 /**
+ * Установить политику по умолчанию для тестов/рантайма.
+ */
+void tasks_set_default_policy(task_sched_policy policy);
+
+/**
+ * Политика по умолчанию для следующего `tasks_init`.
+ */
+task_sched_policy tasks_policy();
+
+/**
  * Отдать управление планировщику, дать путь другим файберам.
  */
 void task_yield(struct task* caller);

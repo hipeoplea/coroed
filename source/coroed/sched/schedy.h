@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 #include "coroed/api/task.h"
 #include "uthread.h"
 
@@ -16,3 +18,5 @@ void sched_wait();
 void sched_print_statistics();
 
 void sched_destroy();
+
+size_t sched_workers_count();
